@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file
-import fitz  # PyMuPDF
+from pdf2image import convert_from_bytes
+from PIL import Image
 import io
 import base64
 import requests
@@ -11,37 +12,45 @@ import uuid
 app = Flask(__name__)
 
 def pdf_page_to_image(pdf_data, page_number=0, dpi=300):
-    """Convert PDF page to image and return as base64"""
-    # Open PDF from bytes
-    doc = fitz.open(stream=pdf_data, filetype="pdf")
-    
-    # Check if page exists
-    if page_number >= len(doc):
-        doc.close()
-        raise ValueError(f"Page {page_number + 1} does not exist. PDF has {len(doc)} pages.")
-    
-    page = doc[page_number]
-    
-    # Convert to image
-    mat = fitz.Matrix(dpi/72, dpi/72)
-    pix = page.get_pixmap(matrix=mat)
-    
-    # Convert to PNG bytes
-    img_data = pix.tobytes("png")
-    doc.close()
-    
-    # Convert to base64 for JSON response
-    img_base64 = base64.b64encode(img_data).decode('utf-8')
-    
-    return img_base64, img_data
+    """Convert PDF page to image using pdf2image"""
+    try:
+        # Convert PDF to images
+        images = convert_from_bytes(
+            pdf_data, 
+            dpi=dpi,
+            first_page=page_number + 1,  # pdf2image uses 1-indexed pages
+            last_page=page_number + 1,
+            fmt='PNG'
+        )
+        
+        if not images:
+            raise ValueError(f"Could not convert page {page_number + 1}")
+            
+        # Get the image
+        image = images[0]
+        
+        # Convert to bytes
+        img_buffer = io.BytesIO()
+        image.save(img_buffer, format='PNG', optimize=True)
+        img_data = img_buffer.getvalue()
+        
+        # Convert to base64
+        img_base64 = base64.b64encode(img_data).decode('utf-8')
+        
+        return img_base64, img_data
+        
+    except Exception as e:
+        if "first page is after last page" in str(e).lower():
+            raise ValueError(f"Page {page_number + 1} does not exist in the PDF")
+        raise e
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for Make.com"""
     return jsonify({
         'status': 'healthy',
-        'message': 'PDF to Image API is running',
-        'version': '1.0'
+        'message': 'PDF to Image API is running (pdf2image)',
+        'version': '1.1'
     })
 
 @app.route('/convert', methods=['POST'])
@@ -65,6 +74,9 @@ def convert_pdf():
         dpi = int(request.form.get('dpi', request.json.get('dpi', 300) if request.json else 300))
         response_format = request.form.get('format', request.json.get('format', 'base64') if request.json else 'base64')
         
+        # Limit DPI to prevent timeouts on free tier
+        dpi = min(dpi, 400)
+        
         pdf_data = None
         filename = "converted_page"
         
@@ -80,11 +92,23 @@ def convert_pdf():
         elif request.json and 'pdf_url' in request.json:
             # Method 2: Download from URL
             pdf_url = request.json['pdf_url']
-            response = requests.get(pdf_url, timeout=30)
-            if response.status_code != 200:
-                return jsonify({'error': 'Failed to download PDF from URL'}), 400
-            pdf_data = response.content
-            filename = f"url_pdf_{uuid.uuid4().hex[:8]}"
+            try:
+                response = requests.get(pdf_url, timeout=20, stream=True)
+                if response.status_code != 200:
+                    return jsonify({'error': f'Failed to download PDF: HTTP {response.status_code}'}), 400
+                
+                # Check content type
+                content_type = response.headers.get('content-type', '').lower()
+                if 'pdf' not in content_type and not pdf_url.lower().endswith('.pdf'):
+                    return jsonify({'error': 'URL does not point to a PDF file'}), 400
+                
+                pdf_data = response.content
+                filename = f"url_pdf_{uuid.uuid4().hex[:8]}"
+                
+            except requests.exceptions.Timeout:
+                return jsonify({'error': 'Timeout downloading PDF from URL'}), 408
+            except requests.exceptions.RequestException as e:
+                return jsonify({'error': f'Failed to download PDF: {str(e)}'}), 400
             
         elif request.json and 'pdf_base64' in request.json:
             # Method 3: Base64 encoded PDF
@@ -99,6 +123,10 @@ def convert_pdf():
         
         if not pdf_data:
             return jsonify({'error': 'No PDF data received'}), 400
+        
+        # Check file size (limit for free tier)
+        if len(pdf_data) > 10 * 1024 * 1024:  # 10MB limit
+            return jsonify({'error': 'PDF file too large. Maximum size: 10MB'}), 400
         
         # Convert PDF to image
         img_base64, img_binary = pdf_page_to_image(pdf_data, page_num, dpi)
@@ -132,25 +160,22 @@ def convert_pdf():
 def convert_pdf_batch():
     """
     Batch conversion endpoint for multiple pages
-    
-    JSON payload:
-    {
-        "pdf_url": "https://example.com/file.pdf",
-        "pages": [1, 2, 3],  // page numbers (1-indexed)
-        "dpi": 300
-    }
     """
     try:
         if not request.json:
             return jsonify({'error': 'JSON payload required'}), 400
             
         pages = request.json.get('pages', [1])
-        dpi = request.json.get('dpi', 300)
+        dpi = min(request.json.get('dpi', 300), 400)  # Limit DPI
+        
+        # Limit number of pages for free tier
+        if len(pages) > 5:
+            return jsonify({'error': 'Maximum 5 pages allowed in batch mode'}), 400
         
         # Get PDF data
         pdf_data = None
         if 'pdf_url' in request.json:
-            response = requests.get(request.json['pdf_url'], timeout=30)
+            response = requests.get(request.json['pdf_url'], timeout=20)
             if response.status_code != 200:
                 return jsonify({'error': 'Failed to download PDF'}), 400
             pdf_data = response.content
@@ -158,6 +183,10 @@ def convert_pdf_batch():
             pdf_data = base64.b64decode(request.json['pdf_base64'])
         else:
             return jsonify({'error': 'pdf_url or pdf_base64 required'}), 400
+        
+        # Check file size
+        if len(pdf_data) > 10 * 1024 * 1024:
+            return jsonify({'error': 'PDF file too large for batch processing'}), 400
         
         # Convert multiple pages
         results = []
@@ -186,7 +215,6 @@ def convert_pdf_batch():
     except Exception as e:
         return jsonify({'error': f'Batch conversion failed: {str(e)}'}), 500
 
-# Make.com webhook test endpoint
 @app.route('/test-webhook', methods=['POST'])
 def test_webhook():
     """Test endpoint to verify Make.com webhook setup"""
